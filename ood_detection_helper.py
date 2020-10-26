@@ -14,7 +14,15 @@ from skimage import draw
 from sklearn.metrics import roc_curve
 from sklearn.metrics import classification_report, average_precision_score
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
-    
+from sklearn.neighbors import NearestNeighbors   
+
+import tensorflow_probability as tfp
+tfb = tfp.bijectors
+tfk = tf.keras
+tfkl = tf.keras.layers
+tfpl = tfp.layers
+tfd = tfp.distributions
+
 
 def get_command_line_args(_args):
     parser = utils._build_parser()
@@ -75,6 +83,150 @@ def load_model(inlier_name="cifar10", checkpoint=-1, save_path="saved_models/",
                                                 verbose=True)
     return model
 
+def result_dict(train_score, test_score, ood_scores, metrics):
+    return {
+        "train_scores":train_score,
+        "test_scores": test_score,
+        "ood_scores": ood_scores,
+        "metrics": metrics
+        }
+
+def auxiliary_model_analysis(X_train, X_test, outliers, labels, flow_epochs=1000):
+
+    def get_metrics(test_score, ood_scores, **kwargs):
+        metrics = {}
+        for idx, _score in enumerate(ood_scores):
+            ood_name = labels[idx+2]
+            metrics[ood_name] = ood_metrics(test_score, _score,
+                                    names=(labels[1], ood_name))
+        metrics_df = pd.DataFrame(metrics).T * 100 # Percentages
+        return metrics_df
+
+    
+
+    print("====="*5 + " Training GMM " + "====="*5)
+    best_gmm_clf = train_gmm(X_train,  verbose=True)
+    print("---Likelihoods---")
+    print("Training: {:.3f}".format(best_gmm_clf.score(X_train)))
+    print("{}: {:.3f}".format(labels[1], best_gmm_clf.score(X_test)))
+
+    for name, ood in zip(labels[2:], outliers):
+        print("{}: {:.3f}".format(name, best_gmm_clf.score(ood)))
+
+    gmm_train_score = best_gmm_clf.score_samples(X_train)
+    gmm_test_score = best_gmm_clf.score_samples(X_test)
+    gmm_ood_scores = np.array([best_gmm_clf.score_samples(ood) for ood in outliers])
+    gmm_metrics = get_metrics(-gmm_test_score, -gmm_ood_scores)
+    gmm_results = result_dict(gmm_train_score, gmm_test_score, gmm_ood_scores, gmm_metrics)
+
+    print("====="*5 + " Training Flow Model " + "====="*5)
+    flow_model = train_flow(X_train, X_test, epochs=flow_epochs)
+    flow_train_score = flow_model.log_prob(X_train, dtype=np.float32).numpy()
+    flow_test_score = flow_model.log_prob(X_test, dtype=np.float32).numpy()
+    flow_ood_scores = np.array([flow_model.log_prob(ood, dtype=np.float32).numpy() for ood in outliers])
+
+    
+
+    flow_metrics = get_metrics(-flow_test_score, -flow_ood_scores)
+    flow_results = result_dict(flow_train_score, flow_test_score, flow_ood_scores, flow_metrics)
+    
+
+    print("====="*5 + " Training KD Tree " + "====="*5)
+
+    N_NEIGHBOURS = 5
+    nbrs = NearestNeighbors(n_neighbors=N_NEIGHBOURS, algorithm='kd_tree').fit(X_train)
+
+    kd_train_score, indices = nbrs.kneighbors(X_train)
+    kd_train_score = kd_train_score[...,-1] # Distances to the kth neighbour
+    kd_test_score, _ = nbrs.kneighbors(X_test)
+    kd_test_score = kd_test_score[...,-1]
+    kd_ood_scores = []
+    for ood in outliers:
+        dists, _ = nbrs.kneighbors(ood)
+        kd_ood_scores.append(dists[...,-1]) 
+    kd_metrics = get_metrics(kd_test_score, kd_ood_scores)
+
+    kd_results = result_dict(kd_train_score, kd_test_score, kd_ood_scores, kd_metrics)
+
+    return dict(GMM=gmm_results, Flow=flow_results, KD=kd_results)
+
+
+def train_gmm(X_train, components_range=range(2,21,2) ,verbose=False):
+    from sklearn.mixture import GaussianMixture
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+    
+    gmm_clf = Pipeline([
+        ("scaler", StandardScaler()),
+        ("GMM", GaussianMixture())
+    ])
+
+    param_grid = dict(GMM__n_components = components_range,
+                      GMM__covariance_type = ['full']) # Full always performs best 
+
+    grid = GridSearchCV(estimator=gmm_clf,
+                        param_grid=param_grid,
+                        cv=10, n_jobs=10,
+                        verbose=1)
+
+    grid_result = grid.fit(X_train)
+    print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
+    if verbose:
+        print("-----"*15)
+        means = grid_result.cv_results_['mean_test_score']
+        stds = grid_result.cv_results_['std_test_score']
+        params = grid_result.cv_results_['params']
+        for mean, stdev, param in zip(means, stds, params):
+            print("%f (%f) with: %r" % (mean, stdev, param))
+        plt.plot([p["GMM__n_components"] for p in params], means)
+        plt.show()
+
+    
+    best_gmm_clf = gmm_clf.set_params(**grid.best_params_)
+    best_gmm_clf.fit(X_train)
+    
+    return best_gmm_clf
+
+def train_flow(X_train, X_test, batch_size=128, epochs=1000, verbose=True):
+
+    
+    # Density estimation with MADE.
+    n = X_train.shape[0]
+    made = tfb.AutoregressiveNetwork(params=2, hidden_units=[128, 128], activation="elu")
+
+    distribution = tfd.TransformedDistribution(
+        distribution=tfd.Normal(loc=0., scale=1.),
+        bijector=tfb.MaskedAutoregressiveFlow(made),
+        event_shape=[X_train.shape[1]] # Input dimension of scores (L=10 for our tests)
+        )
+
+    # Construct and fit model.
+    x_ = tfkl.Input(shape=(X_train.shape[1],), dtype=tf.float32)
+    log_prob_ = distribution.log_prob(x_)
+    model = tfk.Model(x_, log_prob_)
+
+    model.compile(optimizer=tf.optimizers.Adadelta(learning_rate=0.01),
+                loss=lambda _, log_prob: -log_prob)
+
+    history = model.fit(
+        x=X_train,
+        y=np.zeros((n, 0), dtype=np.float32),
+        validation_data=(X_test, np.zeros((X_test.shape[0], 0), dtype=np.float32)),
+        batch_size=batch_size,
+        epochs=epochs,
+        steps_per_epoch=n//batch_size,  # Usually `n // batch_size`.
+        shuffle=True,
+        verbose=verbose)
+
+    if verbose:
+        start_idx=5 # First few epoch losses are very large
+        plt.plot(range(start_idx, epochs), history.history["loss"][start_idx:], label="Train")
+        plt.plot(range(start_idx, epochs), history.history["val_loss"][start_idx:], label="Test")
+        plt.legend()
+        plt.show()
+
+    return distribution # Return distribution optmizied via MLE 
 
 def compute_scores(model, x_test):
     
@@ -214,7 +366,7 @@ def ood_metrics(inlier_score, outlier_score, plot=False, verbose=False,
         
     return metrics
 
-def plot_embedding(embedding, labels, captions):
+def plot_embedding(embedding, labels, captions, d3=False):
     
     plt.figure(figsize=(20,10))
 
@@ -223,60 +375,38 @@ def plot_embedding(embedding, labels, captions):
                     hue=captions, s=15, alpha=0.45, palette="muted", edgecolor="none")
     plt.show()
     # plt.close()
+    if d3:
+        emb3d = go.Scatter3d(
+            x=embedding[:,0],
+            y=embedding[:,1],
+            z=embedding[:,2],
+            mode="markers",
+            name="Score Norms",
+            marker=dict(
+                size=2,
+                color=labels,
+                colorscale="Blackbody",
+                opacity=0.5,
+                showscale=True
+            ),
+            text=captions
+        )
 
-    emb3d = go.Scatter3d(
-        x=embedding[:,0],
-        y=embedding[:,1],
-        z=embedding[:,2],
-        mode="markers",
-        name="Score Norms",
-        marker=dict(
-            size=2,
-            color=labels,
-            colorscale="Blackbody",
-            opacity=0.5,
-            showscale=True
-        ),
-        text=captions
-    )
+        layout = go.Layout(
+            title="3D UMAP",
+            autosize=False,
+            width=1000,
+            height=800,
+        #     paper_bgcolor='#F5F5F5',
+        #     template="plotly"
+        )
 
-    layout = go.Layout(
-        title="3D UMAP",
-        autosize=False,
-        width=1000,
-        height=800,
-    #     paper_bgcolor='#F5F5F5',
-    #     template="plotly"
-    )
+        data=[emb3d]
 
-    data=[emb3d]
-
-    fig = go.Figure(data=data, layout=layout)
-    fig.show("notebook")
+        fig = go.Figure(data=data, layout=layout)
+        fig.show("notebook")
 
     return
-# def evaluate_model(train_score, test_score, outlier_score, outlier_score_2, labels):
-#     fig, axs = plt.subplots(2,1, figsize=(16,8))
-#     colors = ["red", "blue", "green", "orange"]
-
-#     sns.distplot(train_score,color=colors[0], label="Training", ax=axs[0])
-#     sns.distplot(test_score, color=colors[1], label=labels[1], ax=axs[0])
-#     sns.distplot(outlier_score, color=colors[2], label=labels[2], ax=axs[0])
-#     sns.distplot(outlier_score_2, color=colors[3], label=labels[3], ax=axs[0])
-
-#     sns.distplot(test_score, color=colors[1], label=labels[1], ax=axs[1])
-#     sns.distplot(outlier_score, color=colors[2], label=labels[2], ax=axs[1])
-
-#     axs[0].legend()
-#     axs[1].legend()
-#     plt.show()
-    
-#     ood_metrics(-test_score, -outlier_score_2, names=(labels[1], labels[3]),
-#                 plot=False, verbose=True)
-#     print()
-#     ood_metrics(-test_score, -outlier_score, names=(labels[1], labels[2]),
-#                 plot=False, verbose=True)
-#     return
 
 def evaluate_model(train_score, inlier_score, outlier_scores, labels, ylim=None, xlim=None, **kwargs):
     rows = 1 + int(np.ceil(len(outlier_scores)/2))
@@ -312,43 +442,6 @@ def evaluate_model(train_score, inlier_score, outlier_scores, labels, ylim=None,
     plt.show()
     
     return
-
-
-def train_gmm(X_train, components_range=range(2,21,2) ,verbose=False):
-    from sklearn.mixture import GaussianMixture
-    from sklearn.model_selection import GridSearchCV
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.pipeline import Pipeline
-    
-    gmm_clf = Pipeline([
-        ("scaler", StandardScaler()),
-        ("GMM", GaussianMixture())
-    ])
-
-    param_grid = dict(GMM__n_components = components_range,
-                      GMM__covariance_type = ['full']) # Full always performs best 
-
-    grid = GridSearchCV(estimator=gmm_clf,
-                        param_grid=param_grid,
-                        cv=10, n_jobs=10,
-                        verbose=1)
-
-    grid_result = grid.fit(X_train)
-    print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
-    if verbose:
-        print("-----"*15)
-        means = grid_result.cv_results_['mean_test_score']
-        stds = grid_result.cv_results_['std_test_score']
-        params = grid_result.cv_results_['params']
-        for mean, stdev, param in zip(means, stds, params):
-            print("%f (%f) with: %r" % (mean, stdev, param))
-        plt.plot([p["GMM__n_components"] for p in params], means)
-
-    
-    best_gmm_clf = gmm_clf.set_params(**grid.best_params_)
-    best_gmm_clf.fit(X_train)
-    
-    return best_gmm_clf
 
 def make_circle(radius=80, center=(100,100), grid_size=200, stroke=3):
     
