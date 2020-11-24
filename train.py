@@ -105,8 +105,7 @@ def main():
                                     dtype=tf.dtypes.int32)
         sigmas = tf.gather(SIGMA_LEVELS, idx_sigmas)
 
-        # --> Noise is only applied to foreground
-        # Conditioned Noise..?
+        # --> Noise may only be applied to foreground
         x_batch, masks = tf.split(data_batch, SPLITS, axis=-1)
         sigmas = tf.reshape(sigmas, shape=(x_batch.shape[0], 1, 1, 1))
         perturbation =  tf.random.normal(shape=x_batch.shape) * sigmas
@@ -116,7 +115,6 @@ def main():
 
         with tf.GradientTape() as t:
             scores = model([data_batch_perturbed, idx_sigmas])
-            # current_loss = dsm_loss(scores, x_perturbed, x_batch, sigmas, masks)
             current_loss = dsm_loss(scores, x_perturbed, x_batch, sigmas)
             gradients = t.gradient(current_loss, model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
