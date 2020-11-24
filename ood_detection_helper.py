@@ -37,8 +37,8 @@ def get_command_line_args(_args):
     # print("=" * 20 + "\n")
     return parser
 
-configs.config_values = get_command_line_args([])
-SIGMAS = utils.get_sigma_levels().numpy()
+# configs.config_values = get_command_line_args([])
+# SIGMAS = utils.get_sigma_levels().numpy()
 
 @tf.function(experimental_compile=True)
 def reduce_norm(x):
@@ -63,13 +63,16 @@ def full_norm(x):
 
 
 def load_model(inlier_name="cifar10", checkpoint=-1, save_path="saved_models/",
-                filters=128, batch_size=1000, split="100,0"):
+               filters=128, batch_size=1000, split="100,0",
+               s_low=0.01, s_high=1, num_L=10):
+    
     args = get_command_line_args([
         "--checkpoint_dir=" + save_path,
         "--filters=" + str(filters),
         "--dataset=" + inlier_name,
-        "--sigma_low=0.01",
-        "--sigma_high=1",
+        "--sigma_low=" + str(s_low),
+        "--sigma_high=" + str(s_high),
+        "--num_L=" + str(num_L),
         "--resume_from=" + str(checkpoint),
         "--batch_size=" + str(batch_size),
         "--split=" + split
@@ -151,43 +154,6 @@ def auxiliary_model_analysis(X_train, X_test, outliers, labels, flow_epochs=1000
     return dict(GMM=gmm_results, Flow=flow_results, KD=kd_results)
 
 
-def train_gmm(X_train, components_range=range(2,21,2) ,verbose=False):
-    from sklearn.mixture import GaussianMixture
-    from sklearn.model_selection import GridSearchCV
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.pipeline import Pipeline
-    
-    gmm_clf = Pipeline([
-        ("scaler", StandardScaler()),
-        ("GMM", GaussianMixture())
-    ])
-
-    param_grid = dict(GMM__n_components = components_range,
-                      GMM__covariance_type = ['full']) # Full always performs best 
-
-    grid = GridSearchCV(estimator=gmm_clf,
-                        param_grid=param_grid,
-                        cv=10, n_jobs=10,
-                        verbose=1)
-
-    grid_result = grid.fit(X_train)
-    print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
-    if verbose:
-        print("-----"*15)
-        means = grid_result.cv_results_['mean_test_score']
-        stds = grid_result.cv_results_['std_test_score']
-        params = grid_result.cv_results_['params']
-        for mean, stdev, param in zip(means, stds, params):
-            print("%f (%f) with: %r" % (mean, stdev, param))
-        plt.plot([p["GMM__n_components"] for p in params], means)
-        plt.show()
-
-    
-    best_gmm_clf = gmm_clf.set_params(**grid.best_params_)
-    best_gmm_clf.fit(X_train)
-    
-    return best_gmm_clf
-
 def train_flow(X_train, X_test, batch_size=128, epochs=1000, verbose=True):
 
     
@@ -228,28 +194,26 @@ def train_flow(X_train, X_test, batch_size=128, epochs=1000, verbose=True):
 
     return distribution # Return distribution optmizied via MLE 
 
-def compute_scores(model, x_test):
-    
+def compute_weighted_scores(model, x_test):
     # Sigma Idx -> Score
     score_dict = []
-    
-    sigmas = utils.get_sigma_levels().numpy()
+    sigmas = utils.get_sigma_levels()
     final_logits = 0 #tf.zeros(logits_shape)
     progress_bar = tqdm(sigmas)
     for idx, sigma in enumerate(progress_bar):
         
         progress_bar.set_description("Sigma: {:.4f}".format(sigma))
-        _logits =[]
-
+        _logits = []
         for x_batch in x_test:
             idx_sigmas = tf.ones(x_batch.shape[0], dtype=tf.int32) * idx
-            score = model([x_batch, idx_sigmas])
+            score = model([x_batch, idx_sigmas]) * sigma
+            score = reduce_norm(score)
             _logits.append(score)
-
-        _logits = tf.concat(_logits, axis=0)
-        score_dict.append(tf.identity(_logits))
-
-    return tf.stack(score_dict, axis=0)
+        score_dict.append(tf.identity(tf.concat(_logits, axis=0)))
+    
+    # N x L Matrix of score norms
+    scores =  tf.squeeze(tf.stack(score_dict, axis=1))
+    return scores
 
 def plot_curves(inlier_score, outlier_score, label, axs=()):
 
@@ -366,7 +330,7 @@ def ood_metrics(inlier_score, outlier_score, plot=False, verbose=False,
         
     return metrics
 
-def plot_embedding(embedding, labels, captions, d3=False):
+def plot_embedding(embedding, labels, captions):
     
     plt.figure(figsize=(20,10))
 
@@ -375,36 +339,36 @@ def plot_embedding(embedding, labels, captions, d3=False):
                     hue=captions, s=15, alpha=0.45, palette="muted", edgecolor="none")
     plt.show()
     # plt.close()
-    if d3:
-        emb3d = go.Scatter3d(
-            x=embedding[:,0],
-            y=embedding[:,1],
-            z=embedding[:,2],
-            mode="markers",
-            name="Score Norms",
-            marker=dict(
-                size=2,
-                color=labels,
-                colorscale="Blackbody",
-                opacity=0.5,
-                showscale=True
-            ),
-            text=captions
-        )
 
-        layout = go.Layout(
-            title="3D UMAP",
-            autosize=False,
-            width=1000,
-            height=800,
-        #     paper_bgcolor='#F5F5F5',
-        #     template="plotly"
-        )
+    emb3d = go.Scatter3d(
+        x=embedding[:,0],
+        y=embedding[:,1],
+        z=embedding[:,2],
+        mode="markers",
+        name="Score Norms",
+        marker=dict(
+            size=2,
+            color=labels,
+            colorscale="Blackbody",
+            opacity=0.5,
+            showscale=True
+        ),
+        text=captions
+    )
 
-        data=[emb3d]
+    layout = go.Layout(
+        title="3D UMAP",
+        autosize=False,
+        width=1000,
+        height=800,
+    #     paper_bgcolor='#F5F5F5',
+    #     template="plotly"
+    )
 
-        fig = go.Figure(data=data, layout=layout)
-        fig.show("notebook")
+    data=[emb3d]
+
+    fig = go.Figure(data=data, layout=layout)
+    fig.show("notebook")
 
     return
 
@@ -439,9 +403,47 @@ def evaluate_model(train_score, inlier_score, outlier_scores, labels, ylim=None,
         ax.set_ylim(top=ylim)
         ax.set_xlim(left=xlim, right=100 if xlim else None)
 
-    plt.show()
+    # plt.show()
     
-    return
+    return axs
+
+
+def train_gmm(X_train, components_range=range(2,21,2) ,verbose=False):
+    from sklearn.mixture import GaussianMixture
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+    
+    gmm_clf = Pipeline([
+        ("scaler", StandardScaler()),
+        ("GMM", GaussianMixture())
+    ])
+
+    param_grid = dict(GMM__n_components = components_range,
+                      GMM__covariance_type = ['full']) # Full always performs best 
+
+    grid = GridSearchCV(estimator=gmm_clf,
+                        param_grid=param_grid,
+                        cv=10, n_jobs=10,
+                        verbose=1)
+
+    grid_result = grid.fit(X_train)
+    print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
+    if verbose:
+        print("-----"*15)
+        means = grid_result.cv_results_['mean_test_score']
+        stds = grid_result.cv_results_['std_test_score']
+        params = grid_result.cv_results_['params']
+        for mean, stdev, param in zip(means, stds, params):
+            print("%f (%f) with: %r" % (mean, stdev, param))
+        plt.plot([p["GMM__n_components"] for p in params], means)
+        plt.show()
+
+    
+    best_gmm_clf = gmm_clf.set_params(**grid.best_params_)
+    best_gmm_clf.fit(X_train)
+    
+    return best_gmm_clf
 
 def make_circle(radius=80, center=(100,100), grid_size=200, stroke=3):
     
@@ -513,4 +515,3 @@ def sine_perturb(image, amplitude=1):
     out = warp(image, tform, output_shape=(out_rows, out_cols))
     
     return out
-

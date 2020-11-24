@@ -2,7 +2,7 @@
 
 The `score_analyses` directory contains folders with scores from pretrained networks and notebooks that use them to train auxiliary models. The results/metrics from these auxialiary models were subsequently reported in the paper.
 
-Additionally, files that were used to train the models are provided. Once a model is trained, the user can get weighted score norms by iterating over the corresponding test set using the `compute_scores` function available in `ood_detection_helper.py`.
+Additionally, files that were used to train the models are provided. Once a model is trained, the user can get weighted score norms by iterating over the corresponding test set using the `compute_weighted_scores` function available in `ood_detection_helper.py`.
 
 ```bash
 
