@@ -1,6 +1,6 @@
 # **M**ultiscale **S**core **M**atching **A**nalysis
 
-The `score_analyses` directory contains folders with scores from pretrained networks and notebooks that use them to train auxiliary models. The results/metrics from these auxialiary models were subsequently reported in the paper.
+The `score_analyses` directory contains folders with scores from pretrained networks and notebooks that use them to train auxiliary models. The results/metrics from these auxialiary models were subsequently reported in the paper. Due to size constraints, our model checkpoints are available in [this](https://drive.google.com/drive/folders/1r7nS-U2ECeNkgMiWkLM8eeiN7LliFrQY?usp=sharing) Google Drive folder.
 
 Additionally, files that were used to train the models are provided. Once a model is trained, the user can get weighted score norms by iterating over the corresponding test set using the `compute_weighted_scores` function available in `ood_detection_helper.py`.
 
