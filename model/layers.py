@@ -197,6 +197,7 @@ class MultiResolutionFusion(layers.Layer):
             low_input = self.norm_low([low_input, idx_sigmas])
             low_input = self.conv2d_low(low_input)
             low_input = tf.image.resize(low_input, high_input.shape[1:-1])
+            low_input = tf.cast(low_input, dtype=high_input.dtype)
             high_input = self.norm_high([high_input, idx_sigmas])
             high_input = self.conv2d_high(high_input)
 

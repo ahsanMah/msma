@@ -58,6 +58,8 @@ class RefineNet(keras.Model):
         output = self.norm([output_1, idx_sigmas]) 
         output = self.activation(output)
         output = self.decrease_channels(output)
+        
+        output = tf.keras.layers.Activation("linear", dtype=tf.float32)(output)
 
         return output
 

@@ -2,6 +2,7 @@ import csv
 from datetime import datetime
 
 import tensorflow as tf
+from tensorflow.keras import mixed_precision
 from tqdm import tqdm
 
 import configs
@@ -43,7 +44,10 @@ def train_ocnn_step(model, optimizer, data_batch_perturbed, idx_sigmas, r):
     return current_loss, r
 
 def main():
-
+    
+    policy = mixed_precision.Policy("mixed_float16")
+    mixed_precision.set_global_policy(policy)
+    
     device = utils.get_tensorflow_device()
     tf.random.set_seed(2019)
     LOG_FREQ = 100
@@ -76,7 +80,16 @@ def main():
         with tf.GradientTape() as t:
             scores = model([data_batch_perturbed, idx_sigmas])
             current_loss = dsm_loss(scores, data_batch_perturbed, data_batch, sigmas)
+            
+            if mixed_precision.global_policy().name == "mixed_float16":
+                scaled_loss = optimizer.get_scaled_loss(current_loss)
+
+        if mixed_precision.global_policy().name == "mixed_float16":
+            gradients = t.gradient(scaled_loss, model.trainable_variables)
+            gradients = optimizer.get_unscaled_gradients(gradients)
+        else:
             gradients = t.gradient(current_loss, model.trainable_variables)
+            
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         return current_loss
 
@@ -168,6 +181,10 @@ def main():
 
     model, optimizer, step, ocnn_model, ocnn_optimizer = utils.try_load_model(save_dir,
      step_ckpt=configs.config_values.resume_from, verbose=True, ocnn=configs.config_values.ocnn)
+    
+    if mixed_precision.global_policy().name == "mixed_float16":
+        print("Using mixed-prec optimizer...")
+        optimizer = mixed_precision.LossScaleOptimizer(optimizer)
 
     # Save checkpoint
     ckpt = None
